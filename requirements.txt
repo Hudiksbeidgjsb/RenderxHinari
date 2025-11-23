@@ -1,3 +1,3 @@
 python-telegram-bot==20.7
 telethon==1.30.0
-setuptools
+# imghdr-py is optional since you have imghdr.py in repo
