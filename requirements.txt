@@ -1,4 +1,3 @@
-telethon
-apscheduler
-sqlite3-binary
-python-dotenv
+telethon==1.28.5
+apscheduler==3.10.4
+flask==2.3.3
