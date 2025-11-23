@@ -1,0 +1,4 @@
+telethon
+apscheduler
+sqlite3-binary
+python-dotenv
