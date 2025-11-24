@@ -1226,7 +1226,7 @@ async def resume_forwarders():
 
 # ---------------------- MESSAGE ROUTER (handles states & admin inputs) ----------------------
 
-async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Routes messages depending on user state.
     - login states -> handle_login_states()
