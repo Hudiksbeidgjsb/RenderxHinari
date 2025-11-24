@@ -576,7 +576,6 @@ async def handle_login_states(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Unknown state
     clear_state(uid)
     return await safe_reply(update, "State error — please start again.")
-```0
 # PART 4 — CALLBACK ROUTER (UI NAVIGATION, MANAGE ACCOUNTS, ADMIN PANEL)
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
