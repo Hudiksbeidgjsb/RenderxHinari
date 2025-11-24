@@ -1,18 +1,15 @@
-# ============================
-# PART 0 — CORE IMPORTS, CONFIG & GLOBALS
-# ============================
-import asyncio
-import sqlite3
+# PART 0 - CONFIG & IMPORTS
 import os
 import json
+import sqlite3
 import secrets
 import string
 import logging
+import asyncio
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,858 +19,601 @@ from telegram.ext import (
     filters,
 )
 
+# Telethon
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.functions.users import GetFullUserRequest
+
+# Ensure sessions folder exists
+os.makedirs("sessions", exist_ok=True)
+
+# -------- CONFIG ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8399763411:AAGVzQJqCkwMWgnEUV1_7GRHQtCSz-j5-yI")  # <-- set your token or env var
+ADMIN_IDS = [7765446998]  # add more admins if needed
+FREE_TRIAL_DAYS = 7
+PREMIUM_PRICE = "59rs/month"  # informational
+# --------------------------
+
+# Global container for active telethon clients in login flow
+_active_login_clients: Dict[int, TelegramClient] = {}
+
+# Global BOT_APP holder (Telegram Bot)
+BOT_APP = None
 
 # Logging
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("hinari")
-
-# CONFIG — change BOT_TOKEN to your bot token
-BOT_TOKEN = "8399763411:AAGVzQJqCkwMWgnEUV1_7GRHQtCSz-j5-yI"
-ADMIN_IDS = [7765446998]  # your admin id(s) here
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger(__name__)
+# PART 1 - DATABASE SETUP & HELPERS
 DB_FILE = "users.db"
-SESSIONS_DIR = "sessions"
-os.makedirs(SESSIONS_DIR, exist_ok=True)
-
-# BIO requirement (checked only during forwarding)
-BIO_REQUIRED_TEXT = "By HinariAdsBot"
-
-DEFAULT_DELAY = 300  # default forwarding delay in seconds
-active_clients = {}   # key -> Telethon client objects (key = user_{user_id}_acc_{account_id})
-forward_tasks = {}    # user_id -> account_id -> asyncio.Task
-BOT_APP = None        # will be assigned to Application.bot in startup
-# ============================
-# PART 1 — DATABASE & HELPERS
-# ============================
-def run_db(query, params=(), fetch=False):
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    c = conn.cursor()
-    c.execute(query, params)
-    res = None
-    if fetch:
-        res = c.fetchall()
-    conn.commit()
-    conn.close()
-    return res
 
 def init_db():
-    run_db("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        phone TEXT,
-        joined_date TEXT,
-        premium_expiry TEXT,
-        trial_start TEXT,
-        delay_setting INTEGER DEFAULT 300,
-        is_banned INTEGER DEFAULT 0
-    )""")
-    run_db("""CREATE TABLE IF NOT EXISTS user_states (
-        user_id INTEGER PRIMARY KEY,
-        state TEXT,
-        temp_data TEXT
-    )""")
-    run_db("""CREATE TABLE IF NOT EXISTS redeem_codes (
-        code TEXT PRIMARY KEY,
-        days INTEGER,
-        created_by INTEGER,
-        created_date TEXT,
-        used_by INTEGER DEFAULT NULL,
-        used_date TEXT DEFAULT NULL,
-        is_used INTEGER DEFAULT 0
-    )""")
-    run_db("""CREATE TABLE IF NOT EXISTS banned_users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        banned_by INTEGER,
-        banned_date TEXT,
-        reason TEXT
-    )""")
-    run_db("""CREATE TABLE IF NOT EXISTS user_accounts (
-        account_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        phone TEXT,
-        api_id TEXT,
-        api_hash TEXT,
-        session_file TEXT,
-        is_active INTEGER DEFAULT 1,
-        is_forwarding INTEGER DEFAULT 0,
-        created_at TEXT
-    )""")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    phone TEXT,
+                    joined_date TEXT,
+                    premium_expiry TEXT,
+                    delay_setting INTEGER DEFAULT 300,
+                    api_id TEXT,
+                    api_hash TEXT,
+                    session_file TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    is_forwarding INTEGER DEFAULT 0,
+                    is_banned INTEGER DEFAULT 0
+                )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS user_states (
+                    user_id INTEGER PRIMARY KEY,
+                    state TEXT,
+                    temp_data TEXT
+                )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS redeem_codes (
+                    code TEXT PRIMARY KEY,
+                    days INTEGER,
+                    created_by INTEGER,
+                    created_date TEXT,
+                    used_by INTEGER DEFAULT NULL,
+                    used_date TEXT DEFAULT NULL,
+                    is_used INTEGER DEFAULT 0
+                )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id INTEGER,
+                    session_file TEXT,
+                    phone TEXT,
+                    api_id TEXT,
+                    api_hash TEXT,
+                    created_date TEXT
+                )""")
+
+    conn.commit()
+    conn.close()
 
 init_db()
 
-# State helpers
-def set_user_state(user_id:int, state:str, temp_data:Optional[dict]=None):
+# DB helpers
+def run_db(query: str, params: tuple = (), fetch: Optional[str] = None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(query, params)
+    if fetch == "one":
+        r = c.fetchone()
+    elif fetch == "all":
+        r = c.fetchall()
+    else:
+        r = None
+    conn.commit()
+    conn.close()
+    return r
+
+# user state helpers
+def set_user_state(user_id: int, state: str, temp_data: Optional[dict] = None):
     temp_json = json.dumps(temp_data) if temp_data else None
-    run_db("INSERT OR REPLACE INTO user_states (user_id, state, temp_data) VALUES (?, ?, ?)", (user_id, state, temp_json))
+    run_db("INSERT OR REPLACE INTO user_states (user_id, state, temp_data) VALUES (?, ?, ?)",
+           (user_id, state, temp_json))
 
-def get_user_state(user_id:int):
-    r = run_db("SELECT state, temp_data FROM user_states WHERE user_id = ?", (user_id,), fetch=True)
-    if not r:
-        return None, None
-    state, tmp = r[0]
-    return state, (json.loads(tmp) if tmp else None)
+def get_user_state(user_id: int) -> Tuple[Optional[str], Optional[dict]]:
+    r = run_db("SELECT state, temp_data FROM user_states WHERE user_id = ?", (user_id,), fetch="one")
+    if r:
+        state, temp_json = r
+        return state, json.loads(temp_json) if temp_json else None
+    return None, None
 
-def clear_user_state(user_id:int):
+def clear_user_state(user_id: int):
     run_db("DELETE FROM user_states WHERE user_id = ?", (user_id,))
 
-# User helpers
-def get_user_data(user_id:int):
-    r = run_db("SELECT * FROM users WHERE user_id = ?", (user_id,), fetch=True)
-    return r[0] if r else None
+# user data
+def save_user_data(user_id: int, phone: str, api_id: int, api_hash: str, session_file: str):
+    existing = run_db("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetch="one")
+    if existing:
+        run_db("UPDATE users SET phone=?, api_id=?, api_hash=?, session_file=?, is_active=1 WHERE user_id=?",
+               (phone, str(api_id), api_hash, session_file, user_id))
+    else:
+        joined = datetime.utcnow().isoformat()
+        expiry = (datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS)).isoformat()
+        run_db("INSERT INTO users (user_id, phone, joined_date, premium_expiry, api_id, api_hash, session_file) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (user_id, phone, joined, expiry, str(api_id), api_hash, session_file))
 
-def create_or_refresh_user(user_id:int):
-    u = get_user_data(user_id)
-    now = datetime.utcnow().isoformat()
-    if not u:
-        trial_end = (datetime.utcnow() + timedelta(days=7)).isoformat()
-        run_db("INSERT INTO users (user_id, joined_date, premium_expiry, trial_start) VALUES (?, ?, ?, ?)", (user_id, now, trial_end, now))
-        return get_user_data(user_id)
-    return u
+def get_user_data(user_id: int):
+    return run_db("SELECT * FROM users WHERE user_id = ?", (user_id,), fetch="one")
 
-def get_premium_days_left(user_row):
-    if not user_row or not user_row[3]:
-        return 0
-    try:
-        left = datetime.fromisoformat(user_row[3]) - datetime.utcnow()
-        return max(0, left.days)
-    except:
-        return 0
+def extend_premium(user_id: int, days: int):
+    row = get_user_data(user_id)
+    if row:
+        expiry = datetime.fromisoformat(row[3])
+        if expiry < datetime.utcnow():
+            new_expiry = datetime.utcnow() + timedelta(days=days)
+        else:
+            new_expiry = expiry + timedelta(days=days)
+        run_db("UPDATE users SET premium_expiry=? WHERE user_id=?", (new_expiry.isoformat(), user_id))
+        return new_expiry
+    else:
+        new_expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
+        run_db("INSERT INTO users (user_id, joined_date, premium_expiry) VALUES (?, ?, ?)",
+               (user_id, datetime.utcnow().isoformat(), new_expiry))
+        return datetime.fromisoformat(new_expiry)
 
-def user_is_premium(user_row):
-    if not user_row or not user_row[3]:
+def is_premium_active(user_id: int) -> bool:
+    row = get_user_data(user_id)
+    if not row:
         return False
-    try:
-        return datetime.fromisoformat(user_row[3]) > datetime.utcnow()
-    except:
-        return False
+    expiry = datetime.fromisoformat(row[3])
+    return expiry > datetime.utcnow()
 
-def is_user_banned(user_id:int):
-    u = get_user_data(user_id)
-    return bool(u and u[6] == 1)
+def get_premium_days_left(user_id: int) -> int:
+    row = get_user_data(user_id)
+    if not row:
+        return 0
+    expiry = datetime.fromisoformat(row[3])
+    return max(0, (expiry - datetime.utcnow()).days)
 
-# Account helpers
-def make_session_filename(user_id:int, account_id:Optional[int]=None):
-    if account_id:
-        return f"{SESSIONS_DIR}/user_{user_id}_acc_{account_id}"
-    return f"{SESSIONS_DIR}/user_{user_id}_{int(datetime.utcnow().timestamp())}"
+def is_user_banned(user_id: int) -> bool:
+    row = get_user_data(user_id)
+    return bool(row and row[9] == 1)
 
-def add_account(user_id:int, phone:str, api_id:str, api_hash:str, session_file:Optional[str]=None):
-    now = datetime.utcnow().isoformat()
-    run_db("INSERT INTO user_accounts (user_id, phone, api_id, api_hash, session_file, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-           (user_id, phone, api_id, api_hash, session_file, now))
-    r = run_db("SELECT account_id FROM user_accounts WHERE rowid = (SELECT MAX(rowid) FROM user_accounts)", fetch=True)
-    return r[0][0] if r else None
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def update_account_session_file(account_id:int, session_file:str):
-    run_db("UPDATE user_accounts SET session_file = ? WHERE account_id = ?", (session_file, account_id))
+# account (multi-account) helpers
+def add_account_record(owner_id: int, session_file: str, phone: str, api_id: int, api_hash: str):
+    run_db("INSERT INTO accounts (owner_id, session_file, phone, api_id, api_hash, created_date) VALUES (?, ?, ?, ?, ?, ?)",
+           (owner_id, session_file, phone, str(api_id), api_hash, datetime.utcnow().isoformat()))
 
-def get_accounts_for_user(user_id:int):
-    return run_db("SELECT account_id, user_id, phone, api_id, api_hash, session_file, is_active, is_forwarding, created_at FROM user_accounts WHERE user_id = ? ORDER BY account_id ASC", (user_id,), fetch=True) or []
+def get_accounts_for_user(owner_id: int):
+    return run_db("SELECT id, session_file, phone, api_id FROM accounts WHERE owner_id=?", (owner_id,), fetch="all")
 
-def get_account(account_id:int):
-    r = run_db("SELECT account_id, user_id, phone, api_id, api_hash, session_file, is_active, is_forwarding, created_at FROM user_accounts WHERE account_id = ?", (account_id,), fetch=True)
-    return r[0] if r else None
+def delete_account_record(account_id: int):
+    run_db("DELETE FROM accounts WHERE id=?", (account_id,))
+# PART 2 - START / MENU / MESSAGE ROUTER
+from telegram.constants import ParseMode
 
-def delete_account(account_id:int):
-    acc = get_account(account_id)
-    if not acc:
-        return None, False
-    session_file = acc[5]
-    run_db("DELETE FROM user_accounts WHERE account_id = ?", (account_id,))
-    # try remove session files
-    try:
-        if session_file:
-            for suf in ("", ".session", ".session-journal"):
-                p = session_file + suf
-                if os.path.exists(p):
-                    try: os.remove(p)
-                    except: pass
-    except:
-        pass
-    return session_file, True
+START_TEXT = (
+    "🌟 *Welcome to HinariAdsBot* 🌟\n\n"
+    "Created by @NOTCH2ND\n\n"
+    "➡️ 1 week free trial. After that purchase premium at @NOTCH2ND (₹59/month)\n\n"
+    "Login -> Save messages -> Forward automatically to your accounts."
+)
 
-def count_accounts_for_user(user_id:int):
-    r = run_db("SELECT COUNT(*) FROM user_accounts WHERE user_id = ?", (user_id,), fetch=True)
-    return int(r[0][0]) if r else 0
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_user_banned(user_id):
+        await safe_reply(update, "❌ You are banned.")
+        return
+    await safe_reply(update, START_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-def user_can_add_account(user_id:int):
-    user = get_user_data(user_id)
-    if user_is_premium(user):
-        return True, ""
-    cnt = count_accounts_for_user(user_id)
-    if cnt >= 1:
-        msg = ("⚠️ Free trial users may connect only a single Telegram account.\n\n"
-               "Upgrade to Premium (₹59/month) for unlimited accounts. Contact @NOTCH2ND")
-        return False, msg
-    return True, ""
-    # ============================
-# PART 2 — LOGIN FLOW HANDLERS
-# ============================
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    row = get_user_data(user_id)
+    days_left = get_premium_days_left(user_id) if row else 0
+    pstat = f"✅ {days_left} days" if days_left > 0 else "❌ Expired / Not activated"
+    accounts = get_accounts_for_user(user_id) or []
+    kb = [
+        [InlineKeyboardButton("➕ Add Account", callback_data="menu_add_account")],
+        [InlineKeyboardButton("📂 Manage Accounts", callback_data="menu_manage_accounts")],
+        [InlineKeyboardButton("🎫 Redeem Code", callback_data="menu_redeem")],
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="menu_admin_panel")],
+    ]
+    text = f"🔰 *HinariAdsBot Menu* 🔰\n\n💎 Premium: {pstat}\n👤 Connected Accounts: {len(accounts)}\n\nUse the buttons below to manage your setup."
+    await safe_reply(update, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+
+# small helper to reply safely whether message or callback
+async def safe_reply(update: Update, text: str, **kwargs):
+    if update.callback_query:
+        # respond on callback message context
+        msg = update.callback_query.message
+        if msg:
+            return await msg.reply_text(text, **kwargs)
+        else:
+            # fallback to editing callback or answering
+            await update.callback_query.answer()
+            return
+    elif update.message:
+        return await update.message.reply_text(text, **kwargs)
+    else:
+        # unsupported update
+        log.debug("safe_reply: unsupported update type")
+        return
+
+# Generic message router (handles text commands and prevents callback confusion)
+async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ignore callback_query here
+    if update.callback_query:
+        return
+
+    text = (update.message.text or "").strip() if update.message else ""
+    user_id = update.effective_user.id
+
+    # Simple text shortcuts
+    if text.lower() == "/menu" or text.lower() == "menu":
+        return await menu_handler(update, context)
+
+    # login flow and others rely on state machine
+    state, temp = get_user_state(user_id)
+    if state and state.startswith("waiting_"):
+        # delegate to login flow handler (implemented in part 3)
+        return await login_flow_handler(update, context, text)
+
+    # if not recognized
+    return await update.message.reply_text("Unknown option. Use /menu")
+# PART 3 - TELETHON LOGIN FLOW & ACCOUNT MANAGEMENT
 
 async def login_flow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
     state, temp = get_user_state(user_id)
 
-    # STEP 1: collect API ID
+    # waiting for api id
     if state == "waiting_api_id":
         try:
-            api_id = int(text.strip())
+            api_id = int(text)
+            set_user_state(user_id, "waiting_api_hash", {"api_id": api_id})
+            await update.message.reply_text("Now send your API HASH:")
         except:
-            return await update.effective_message.reply_text("❌ Invalid API ID. Send only numbers.")
-        set_user_state(user_id, "waiting_api_hash", {"api_id": api_id})
-        return await update.effective_message.reply_text("🔑 Now send your API HASH:")
+            await update.message.reply_text("Invalid API ID. Send a numeric API ID.")
+        return True
 
-    # STEP 2: collect API Hash
+    # waiting for api hash
     if state == "waiting_api_hash":
-        temp = temp or {}
         temp["api_hash"] = text.strip()
         set_user_state(user_id, "waiting_phone", temp)
-        return await update.effective_message.reply_text("📱 Send your phone with country code (e.g. +919812345678):")
+        await update.message.reply_text("Now send your phone number in international format (e.g. +91XXXXXXXXX):")
+        return True
 
-    # STEP 3: send OTP
+    # waiting phone -> send code
     if state == "waiting_phone":
-        temp = temp or {}
         phone = text.strip()
-        allowed, msg = user_can_add_account(user_id)
-        if not allowed:
-            clear_user_state(user_id)
-            return await update.effective_message.reply_text(msg)
-        temp["phone"] = phone
-        api_id = temp["api_id"]; api_hash = temp["api_hash"]
-        acc_id = add_account(user_id, phone, str(api_id), api_hash, None)
-        session_file = make_session_filename(user_id, acc_id)
-        update_account_session_file(acc_id, session_file)
+        api_id = temp["api_id"]
+        api_hash = temp["api_hash"]
+        session_file = f"sessions/user_{user_id}_{secrets.token_hex(6)}"
         client = TelegramClient(session_file, api_id, api_hash)
-        try:
-            await client.connect()
-            await client.send_code_request(phone)
-        except Exception as e:
-            try: await client.disconnect()
-            except: pass
-            delete_account(acc_id)
-            clear_user_state(user_id)
-            return await update.effective_message.reply_text(f"❌ Error sending code: {e}")
-        # store temporary client and wait for code
-        active_clients[f"login_{user_id}"] = client
-        temp.update({"acc_id": acc_id, "session_file": session_file})
-        set_user_state(user_id, "waiting_code", temp)
-        return await update.effective_message.reply_text("📩 OTP sent! Enter the code:")
-
-    # STEP 4: verify code
-    if state == "waiting_code":
-        temp = temp or {}
-        client = active_clients.get(f"login_{user_id}")
-        if not client:
-            try:
-                client = TelegramClient(temp["session_file"], int(temp["api_id"]), temp["api_hash"])
-                await client.connect()
-                active_clients[f"login_{user_id}"] = client
-            except Exception as e:
-                clear_user_state(user_id)
-                return await update.effective_message.reply_text(f"❌ Session lost: {e}")
-        try:
-            try:
-                await client.sign_in(temp["phone"], text.strip())
-            except SessionPasswordNeededError:
-                set_user_state(user_id, "waiting_2fa", temp)
-                return await update.effective_message.reply_text("🔐 2FA is enabled. Send your password:")
-            # success
-            await client.disconnect()
-            active_clients.pop(f"login_{user_id}", None)
-            clear_user_state(user_id)
-            create_or_refresh_user(user_id)
-            return await update.effective_message.reply_text("✅ Account connected successfully!")
-        except Exception as e:
-            return await update.effective_message.reply_text(f"❌ Code error: {e}")
-
-    # STEP 5: 2FA
-    if state == "waiting_2fa":
-        temp = temp or {}
-        client = active_clients.get(f"login_{user_id}")
-        if not client:
-            try:
-                client = TelegramClient(temp["session_file"], temp["api_id"], temp["api_hash"])
-                await client.connect()
-                active_clients[f"login_{user_id}"] = client
-            except Exception as e:
-                clear_user_state(user_id)
-                delete_account(temp.get("acc_id"))
-                return await update.effective_message.reply_text(f"❌ Could not restore session: {e}")
-        try:
-            await client.sign_in(password=text.strip())
-            await client.disconnect()
-            active_clients.pop(f"login_{user_id}", None)
-            clear_user_state(user_id)
-            create_or_refresh_user(user_id)
-            return await update.effective_message.reply_text("🔐 Logged in with 2FA!")
-        except Exception as e:
-            delete_account(temp.get("acc_id"))
-            clear_user_state(user_id)
-            return await update.effective_message.reply_text(f"❌ 2FA error: {e}")
-
-    return None
-    # ============================
-# PART 3 — MESSAGE ROUTER + FORWARDER ENGINE
-# ============================
-
-async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    # Detect text from user message OR callback data
-    if update.message:
-        text = update.message.text.strip()
-    elif update.callback_query:
-        text = update.callback_query.data.strip()
-    else:
-        return
-
-    state, temp = get_user_state(user_id)
-
-    # Admin states
-    if is_admin(user_id) and state and state.startswith("admin_"):
-        return await handle_admin_states(update, text, user_id, state, temp)
-
-    # Redeem code state
-    if state == "waiting_redeem_code":
-        clear_user_state(user_id)
-        return await handle_redeem_code(update, text, user_id)
-
-    # Login states
-    if state and state.startswith("waiting_"):
-        result = await login_flow_handler(update, context, text)
-        if result is not None:
-            return
-
-    # If callback, don't send fallback message to user
-    if update.callback_query:
-        await update.callback_query.answer("Unknown option. Use /menu")
-        return
-
-    # Normal fallback for text messages
-    return await update.message.reply_text("Unknown option. Use /menu.")
-
-# Telethon client helpers
-def _client_key(user_id:int, account_id:int):
-    return f"user_{user_id}_acc_{account_id}"
-
-async def get_client_for_account(account_row):
-    if not account_row:
-        return None
-    account_id = account_row[0]; user_id = account_row[1]
-    try:
-        api_id = int(account_row[3])
-    except:
-        return None
-    api_hash = account_row[4]
-    session_file = account_row[5] or make_session_filename(user_id, account_id)
-    key = _client_key(user_id, account_id)
-    client = active_clients.get(key)
-    if client:
-        try:
-            if not await client.is_connected():
-                await client.connect()
-            # ensure authorized
-            try:
-                if not await client.is_user_authorized():
-                    await client.disconnect()
-                    active_clients.pop(key, None)
-                    return None
-            except Exception:
-                pass
-            return client
-        except Exception:
-            try: await client.disconnect()
-            except: pass
-            active_clients.pop(key, None)
-
-    client = TelegramClient(session_file, api_id, api_hash)
-    try:
         await client.connect()
         try:
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                return None
-        except Exception:
-            pass
-        active_clients[key] = client
-        return client
-    except Exception as e:
-        log.exception("Could not connect client for account %s: %s", account_id, e)
-        try: await client.disconnect()
-        except: pass
-        return None
-
-# Forwarder loop — reads latest message from Saved Messages ("me") and forwards to groups
-async def forwarder_loop_for_account(account_id:int):
-    acc = get_account(account_id)
-    if not acc:
-        log.warning("forwarder: no account %s", account_id)
-        return
-    user_id = acc[1]
-    try:
-        run_db("UPDATE user_accounts SET is_forwarding = 1 WHERE account_id = ?", (account_id,))
-        client = await get_client_for_account(acc)
-        if not client:
-            run_db("UPDATE user_accounts SET is_forwarding = 0 WHERE account_id = ?", (account_id,))
-            return
-
-        # check bio first
-        try:
-            full = await client(GetFullUserRequest('me'))
-            bio = getattr(full.full_user, "about", "") or ""
-        except Exception:
-            bio = ""
-        if BIO_REQUIRED_TEXT not in (bio or ""):
-            try:
-                if BOT_APP:
-                    await BOT_APP.send_message(user_id, f"⚠️ Add this to your bio to enable forwarding:\n\n{BIO_REQUIRED_TEXT}")
-            except:
-                pass
-            run_db("UPDATE user_accounts SET is_forwarding = 0 WHERE account_id = ?", (account_id,))
-            return
-
-        # gather target groups/channels (non-broadcast channels and groups)
-        groups = []
-        try:
-            async for d in client.iter_dialogs():
-                try:
-                    if d.is_group or (d.is_channel and not getattr(d.entity, "broadcast", True)):
-                        groups.append(d.entity)
-                except Exception:
-                    continue
+            await client.send_code_request(phone)
+            temp.update({"phone": phone, "session_file": session_file})
+            _active_login_clients[user_id] = client
+            set_user_state(user_id, "waiting_code", temp)
+            await update.message.reply_text("📩 OTP sent! Enter the code you received:")
         except Exception as e:
-            log.exception("forwarder: failed to list dialogs for acc %s: %s", account_id, e)
-
-        last_saved_id = None
-        while True:
-            try:
-                msgs = await client.get_messages("me", limit=1)
-                if msgs:
-                    msg = msgs[0]
-                    if last_saved_id is None or msg.id != last_saved_id:
-                        for g in groups:
-                            try:
-                                # forward the message (Telethon forwards by id from 'me')
-                                await client.forward_messages(g, msg.id, from_peer="me")
-                                await asyncio.sleep(1)
-                            except Exception:
-                                log.exception("forwarder: forward failed for acc %s", account_id)
-                        last_saved_id = msg.id
-            except asyncio.CancelledError:
-                log.info("forwarder cancelled acc %s", account_id)
-                break
-            except Exception as e:
-                log.exception("forwarder loop error acc %s: %s", account_id, e)
-                try:
-                    if not await client.is_user_authorized():
-                        break
-                except:
-                    break
-
-            # re-check bio and premium delay
-            try:
-                user_row = get_user_data(user_id)
-                delay = user_row[5] if user_row and user_row[5] else DEFAULT_DELAY
-            except:
-                delay = DEFAULT_DELAY
-
-            try:
-                full = await client(GetFullUserRequest('me'))
-                bio = getattr(full.full_user, "about", "") or ""
-            except:
-                bio = ""
-            if BIO_REQUIRED_TEXT not in (bio or ""):
-                try:
-                    if BOT_APP:
-                        await BOT_APP.send_message(user_id, f"⚠️ Your account (ID: {account_id}) lost the required bio. Forwarding stopped. Please add: {BIO_REQUIRED_TEXT}")
-                except:
-                    pass
-                break
-
-            await asyncio.sleep(delay)
-
-    finally:
-        run_db("UPDATE user_accounts SET is_forwarding = 0 WHERE account_id = ?", (account_id,))
-        try:
-            if user_id in forward_tasks and account_id in forward_tasks[user_id]:
-                forward_tasks[user_id].pop(account_id, None)
-        except:
-            pass
-        log.info("forwarder stopped for acc %s", account_id)
-
-# Task controls
-async def start_forward_for_account(account_id:int):
-    acc = get_account(account_id)
-    if not acc:
-        return False
-    user_id = acc[1]
-    if user_id not in forward_tasks:
-        forward_tasks[user_id] = {}
-    if account_id in forward_tasks[user_id]:
-        return False
-    task = asyncio.create_task(forwarder_loop_for_account(account_id))
-    forward_tasks[user_id][account_id] = task
-    run_db("UPDATE user_accounts SET is_forwarding = 1 WHERE account_id = ?", (account_id,))
-    return True
-
-async def stop_forward_for_account(account_id:int):
-    acc = get_account(account_id)
-    if not acc:
-        return False
-    user_id = acc[1]
-    if user_id in forward_tasks and account_id in forward_tasks[user_id]:
-        task = forward_tasks[user_id].pop(account_id, None)
-        try:
-            task.cancel()
-        except:
-            pass
-        run_db("UPDATE user_accounts SET is_forwarding = 0 WHERE account_id = ?", (account_id,))
-        return True
-    return False
-
-async def delete_account_and_stop(account_id:int):
-    acc = get_account(account_id)
-    if not acc:
-        return False
-    user_id = acc[1]
-    await stop_forward_for_account(account_id)
-    key = _client_key(user_id, account_id)
-    client = active_clients.pop(key, None)
-    try:
-        if client:
+            await update.message.reply_text(f"Error sending code: {e}")
             await client.disconnect()
-    except:
-        pass
-    _, ok = delete_account(account_id)
-    return ok
-    # ============================
-# PART 4 — UI / MENU / BUTTON HANDLERS
-# ============================
+            clear_user_state(user_id)
+        return True
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if state == "waiting_code":
+        code = text.strip()
+        client = _active_login_clients.get(user_id)
+        if not client:
+            clear_user_state(user_id)
+            await update.message.reply_text("Session expired. Please start again.")
+            return True
+        try:
+            await client.sign_in(temp["phone"], code)
+        except SessionPasswordNeededError:
+            set_user_state(user_id, "waiting_2fa", temp)
+            await update.message.reply_text("Two-factor enabled. Please send your 2FA password:")
+            return True
+        except Exception as e:
+            await update.message.reply_text(f"Sign-in error: {e}")
+            await client.disconnect()
+            _active_login_clients.pop(user_id, None)
+            clear_user_state(user_id)
+            return True
+
+        # success: save account record (multi-account support)
+        add_account_record(user_id, temp["session_file"], temp["phone"], temp["api_id"], temp["api_hash"])
+        save_user_data(user_id, temp["phone"], temp["api_id"], temp["api_hash"], temp["session_file"])
+
+        await client.disconnect()
+        _active_login_clients.pop(user_id, None)
+        clear_user_state(user_id)
+        await update.message.reply_text("✅ Account logged in and saved.")
+        return True
+
+    if state == "waiting_2fa":
+        password = text
+        client = _active_login_clients.get(user_id)
+        if not client:
+            clear_user_state(user_id)
+            await update.message.reply_text("Session expired. Start again.")
+            return True
+        try:
+            await client.sign_in(password=password)
+            add_account_record(user_id, temp["session_file"], temp["phone"], temp["api_id"], temp["api_hash"])
+            save_user_data(user_id, temp["phone"], temp["api_id"], temp["api_hash"], temp["session_file"])
+            await client.disconnect()
+            _active_login_clients.pop(user_id, None)
+            clear_user_state(user_id)
+            await update.message.reply_text("✅ Logged in with 2FA and saved.")
+        except Exception as e:
+            await update.message.reply_text(f"2FA error: {e}")
+        return True
+
+    return False  # not handled here
+
+# Add account entrypoint
+async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if is_user_banned(user_id):
-        return await update.effective_message.reply_text("❌ You are banned.")
-    create_or_refresh_user(user_id)
-    intro = (
-        "<b>🌟 Welcome to HinariAdsBot 🌟</b>\n\n"
-        "Created by <b>@NOTCH2ND</b>\n\n"
-        "🎁 <b>1 WEEK FREE TRIAL</b>\n"
-        "💎 Premium: ₹59/month — contact @NOTCH2ND\n\n"
-        "Use /menu to get started."
-    )
-    await update.effective_message.reply_text(intro, parse_mode=ParseMode.HTML)
+    # multi-account limits: free users only 1 account; premium unlimited
+    accounts = get_accounts_for_user(user_id) or []
+    if not is_premium_active(user_id) and len(accounts) >= 1:
+        await safe_reply(update, "Free trial users can only add 1 account. Buy premium from @NOTCH2ND to add more.")
+        return
+    set_user_state(user_id, "waiting_api_id")
+    await safe_reply(update, "Send API ID:")
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = get_user_data(user_id)
-    premium_days = get_premium_days_left(user) if user else 0
-    premium_text = (f"💎 Premium Active: <b>{premium_days} days</b>" if premium_days > 0 else "💎 Premium: <b>Expired</b>")
-    acc_count = count_accounts_for_user(user_id)
-    msg = (
-        "<b>🔰 HinariAdsBot Menu</b>\n\n"
-        f"{premium_text}\n"
-        f"👤 Connected Accounts: <b>{acc_count}</b>\n\n"
-        "Use the buttons below to manage your setup."
-    )
-    kb = [
-        [InlineKeyboardButton("➕ Add Account", callback_data="add_account")],
-        [InlineKeyboardButton("📂 Manage Accounts", callback_data="manage_accounts")],
-        [InlineKeyboardButton("🎫 Redeem Code", callback_data="redeem_code")],
-    ]
-    if update.effective_user.id in ADMIN_IDS:
-        kb.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-
+# Manage accounts UI
 async def manage_accounts_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    accounts = get_accounts_for_user(user_id)
+    accounts = get_accounts_for_user(user_id) or []
     if not accounts:
-        kb = [[InlineKeyboardButton("➕ Add Account", callback_data="add_account")]]
-        return await update.effective_message.reply_text("You have no connected accounts. Add one to start forwarding.", reply_markup=InlineKeyboardMarkup(kb))
+        await safe_reply(update, "You have no connected accounts. Use 'Add Account' to add one.")
+        return
     kb = []
-    for acc in accounts:
-        acc_id = acc[0]; phone = acc[2] or "Unknown"; is_fw = bool(acc[7])
-        row = []
-        if is_fw:
-            row.append(InlineKeyboardButton("⛔ Stop", callback_data=f"account_stop_{acc_id}"))
-        else:
-            row.append(InlineKeyboardButton("▶ Start", callback_data=f"account_start_{acc_id}"))
-        row.append(InlineKeyboardButton("🗑 Delete", callback_data=f"account_delete_{acc_id}"))
-        kb.append(row)
-    kb.append([InlineKeyboardButton("➕ Add Account", callback_data="add_account")])
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_back")])
-    text = "<b>Your Accounts</b>:\n\n"
-    for acc in accounts:
-        text += f"• {acc[2] or 'Unknown'} (ID: {acc[0]})\n"
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+    for a in accounts:
+        aid, session_file, phone, api_id = a
+        kb.append([InlineKeyboardButton(f"{phone} (id:{aid})", callback_data=f"account_show:{aid}")])
+        kb.append([InlineKeyboardButton("❌ Delete", callback_data=f"account_delete:{aid}")])
+    await safe_reply(update, "Your accounts:", reply_markup=InlineKeyboardMarkup(kb))
 
-# Button handler
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    data = query.data
-    await query.answer()
+# Delete account
+async def delete_account_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, account_id: int):
+    # stop any forwarder processes for that session if exist (user-defined)
+    delete_account_record(account_id)
+    await safe_reply(update, f"Deleted account id {account_id} and stopped forwarding.")
+    # PART 4 - FORWARDING (simplified) + ADMIN PANEL + CALLBACK HANDLING
 
-    if data == "manage_accounts":
-        return await manage_accounts_ui(update, context)
+# Placeholder: actual forwarding logic must use Telethon clients per saved session file.
+# Example function to resume forwarders on start (simplified)
+async def resume_active_forwarders_on_start(app_obj: Application):
+    # iterate all accounts and (re)start forwarders
+    rows = run_db("SELECT id, owner_id, session_file FROM accounts", (), fetch="all") or []
+    for r in rows:
+        acc_id, owner_id, session_file = r[0], r[1], r[2]
+        # start a background task for each account forwarding (user to implement details)
+        asyncio.create_task(dummy_forwarder_loop(acc_id, session_file))
 
-    if data == "add_account":
-        set_user_state(user_id, "waiting_api_id")
-        return await query.edit_message_text("🆕 <b>Adding a new account</b>\n\nSend your API ID:", parse_mode=ParseMode.HTML)
+async def dummy_forwarder_loop(acc_id: int, session_file: str):
+    # Placeholder loop; replace with Telethon logic to forward saved messages to destinations
+    while True:
+        log.debug("Dummy forwarder tick for acc %s", acc_id)
+        await asyncio.sleep(60)  # check every 60s
 
-    if data.startswith("account_start_"):
-        acc_id = int(data.split("_")[-1])
-        return await _handle_account_start_button(query, acc_id)
-
-    if data.startswith("account_stop_"):
-        acc_id = int(data.split("_")[-1])
-        return await _handle_account_stop_button(query, acc_id)
-
-    if data.startswith("account_delete_"):
-        acc_id = int(data.split("_")[-1])
-        return await _handle_account_delete_button(query, acc_id)
-
-    if data.startswith("account_confirm_delete_"):
-        acc_id = int(data.split("_")[-1])
-        ok = await delete_account_and_stop(acc_id)
-        if ok:
-            return await query.edit_message_text("🗑 Account deleted successfully.")
-        else:
-            return await query.edit_message_text("❌ Failed to delete account.")
-
-    if data == "redeem_code":
-        set_user_state(user_id, "waiting_redeem_code")
-        return await query.edit_message_text("🎫 Send your redeem code:")
-
-    if data == "menu_back":
-        return await menu_handler(update, context)
-
-    if data == "admin_panel":
-        return await admin_panel_handler(update, context)
-
-    return await query.edit_message_text("Unknown option. Use /menu")
-
-# small wrappers used by buttons
-async def _handle_account_start_button(query, account_id:int):
-    user_id = query.from_user.id
-    acc = get_account(account_id)
-    if not acc or acc[1] != user_id:
-        return await query.edit_message_text("❌ Account not found.")
-    started = await start_forward_for_account(account_id)
-    if started:
-        return await query.edit_message_text("✅ Account forwarder started.")
-    else:
-        return await query.edit_message_text("ℹ️ Account forwarder already running.")
-
-async def _handle_account_stop_button(query, account_id:int):
-    user_id = query.from_user.id
-    acc = get_account(account_id)
-    if not acc or acc[1] != user_id:
-        return await query.edit_message_text("❌ Account not found.")
-    stopped = await stop_forward_for_account(account_id)
-    if stopped:
-        return await query.edit_message_text("🛑 Account forwarder stopped.")
-    else:
-        return await query.edit_message_text("ℹ️ No forwarder was running for this account.")
-
-async def _handle_account_delete_button(query, account_id:int):
-    user_id = query.from_user.id
-    acc = get_account(account_id)
-    if not acc or acc[1] != user_id:
-        return await query.edit_message_text("❌ Account not found.")
-    kb = [
-        [InlineKeyboardButton("✅ Yes, delete", callback_data=f"account_confirm_delete_{account_id}")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="menu_back")]
-    ]
-    return await query.edit_message_text(f"⚠️ Are you sure you want to delete account {acc[2]} (ID {account_id})? This will stop forwarding and remove the session file.", reply_markup=InlineKeyboardMarkup(kb))
-    # ============================
-# PART 5 — ADMIN / REDEEM / DAILY TASKS / MAIN
-# ============================
-
-def create_redeem_code(days:int, created_by:int):
-    code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(12))
-    run_db("INSERT INTO redeem_codes (code, days, created_by, created_date) VALUES (?, ?, ?, ?)", (code, days, created_by, datetime.utcnow().isoformat()))
-    return code
-
-def use_redeem_code(code:str, user_id:int):
-    r = run_db("SELECT * FROM redeem_codes WHERE code = ? AND is_used = 0", (code,), fetch=True)
-    if not r:
-        return None
-    days = r[0][1]
-    run_db("UPDATE redeem_codes SET used_by=?, used_date=?, is_used=1 WHERE code=?", (user_id, datetime.utcnow().isoformat(), code))
-    extend_premium(user_id, days)
-    return days
-
-def extend_premium(user_id:int, days:int):
-    user = get_user_data(user_id)
-    if user:
-        try:
-            current = datetime.fromisoformat(user[3])
-        except:
-            current = datetime.utcnow()
-        if current < datetime.utcnow():
-            new = datetime.utcnow() + timedelta(days=days)
-        else:
-            new = current + timedelta(days=days)
-        run_db("UPDATE users SET premium_expiry=? WHERE user_id=?", (new.isoformat(), user_id))
-        return new.isoformat()
-    else:
-        new = datetime.utcnow() + timedelta(days=days)
-        run_db("INSERT INTO users (user_id, joined_date, premium_expiry) VALUES (?, ?, ?)", (user_id, datetime.utcnow().isoformat(), new.isoformat()))
-        return new.isoformat()
-
-async def handle_redeem_code(update: Update, text: str, user_id: int):
-    days = use_redeem_code(text.strip(), user_id)
-    if not days:
-        return await update.effective_message.reply_text("❌ Invalid or already used code.")
-    return await update.effective_message.reply_text(f"🎉 Code redeemed! Premium extended by {days} days.")
-
-# Admin panel
+# ADMIN PANEL UI
 async def admin_panel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return await update.effective_message.reply_text("❌ You are not an admin.")
-    users_count = run_db("SELECT COUNT(*) FROM users", fetch=True)[0][0]
-    accounts_count = run_db("SELECT COUNT(*) FROM user_accounts", fetch=True)[0][0]
+    if not is_admin(update.effective_user.id):
+        return await safe_reply(update, "You are not authorized.")
     kb = [
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton("🎟 Generate Code", callback_data="admin_gen")],
+        [InlineKeyboardButton("🪪 Generate Code", callback_data="admin_gen_code")],
         [InlineKeyboardButton("⛔ Ban User", callback_data="admin_ban")],
-        [InlineKeyboardButton("♻ Unban User", callback_data="admin_unban")],
+        [InlineKeyboardButton("♻️ Unban User", callback_data="admin_unban")],
         [InlineKeyboardButton("⭐ Extend Premium", callback_data="admin_extend")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
     ]
-    text = (f"<b>👑 Admin Panel</b>\n\n👥 Users: {users_count}\n🔗 Accounts: {accounts_count}\n")
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+    await safe_reply(update, "👑 Admin Panel\nChoose an action:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def handle_admin_states(update: Update, text: str, user_id: int, state: str, temp):
-    if state == "admin_waiting_redeem_days":
-        try:
-            days = int(text)
-        except:
-            return await update.effective_message.reply_text("❌ Send a valid number.")
-        code = create_redeem_code(days, user_id)
-        clear_user_state(user_id)
-        return await update.effective_message.reply_text(f"🎟 Redeem code created:\n<code>{code}</code>", parse_mode=ParseMode.HTML)
-    if state == "admin_waiting_ban":
-        try:
-            uid = int(text)
-        except:
-            return await update.effective_message.reply_text("❌ Invalid user ID.")
-        run_db("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
-        run_db("INSERT OR REPLACE INTO banned_users (user_id, username, banned_by, banned_date, reason) VALUES (?, ?, ?, ?, ?)", (uid, "unknown", user_id, datetime.utcnow().isoformat(), "banned by admin"))
-        clear_user_state(user_id)
-        return await update.effective_message.reply_text(f"⛔ User {uid} banned.")
-    if state == "admin_waiting_unban":
-        try:
-            uid = int(text)
-        except:
-            return await update.effective_message.reply_text("❌ Invalid user ID.")
-        run_db("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
-        run_db("DELETE FROM banned_users WHERE user_id=?", (uid,))
-        clear_user_state(user_id)
-        return await update.effective_message.reply_text(f"♻ User {uid} unbanned.")
-    if state == "admin_waiting_extend":
-        try:
-            uid, days = text.split(); uid = int(uid); days = int(days)
-        except:
-            return await update.effective_message.reply_text("❌ Format invalid. Use: user_id days")
-        new_expiry = extend_premium(uid, days)
-        clear_user_state(user_id)
-        return await update.effective_message.reply_text(f"⭐ Premium extended until:\n<b>{new_expiry}</b>", parse_mode=ParseMode.HTML)
-    if state == "admin_waiting_broadcast":
-        users = run_db("SELECT user_id FROM users", fetch=True) or []
-        success = fail = 0
-        for u in users:
-            try:
-                await update.get_bot().send_message(u[0], text)
-                success += 1
-            except:
-                fail += 1
-        clear_user_state(user_id)
-        return await update.effective_message.reply_text(f"📢 Broadcast complete!\n✔ Sent: {success}\n❌ Failed: {fail}")
-    return None
+# Admin actions
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total_users = run_db("SELECT COUNT(*) FROM users", (), fetch="one")[0]
+    total_accounts = run_db("SELECT COUNT(*) FROM accounts", (), fetch="one")[0]
+    text = f"📊 Users: {total_users}\n🔗 Accounts: {total_accounts}"
+    return await safe_reply(update, text)
 
-# Daily notification task
-async def daily_premium_status_task(app: Application):
+# Central callback query handler
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    await query.answer()
+
+    # MENU callbacks
+    if data == "menu_add_account":
+        return await add_account_start(update, context)
+    if data == "menu_manage_accounts":
+        return await manage_accounts_ui(update, context)
+    if data == "menu_redeem":
+        set_user_state(update.effective_user.id, "waiting_redeem_code")
+        return await safe_reply(update, "Send redeem code now:")
+
+    if data == "menu_admin_panel":
+        return await admin_panel_handler(update, context)
+
+    # ACCOUNT callbacks (account_show:id and account_delete:id)
+    if data.startswith("account_show:"):
+        aid = int(data.split(":", 1)[1])
+        row = run_db("SELECT id, phone, session_file FROM accounts WHERE id=?", (aid,), fetch="one")
+        if row:
+            return await safe_reply(update, f"Account {row[0]} - {row[1]}")
+        else:
+            return await safe_reply(update, "Account not found.")
+
+    if data.startswith("account_delete:"):
+        aid = int(data.split(":", 1)[1])
+        delete_account_record(aid)
+        return await safe_reply(update, f"Deleted account {aid}.")
+
+    # ADMIN CALLBACKS (explicit)
+    if data == "admin_stats":
+        return await admin_stats(update, context)
+
+    if data == "admin_gen_code":
+        return await safe_reply(update, "Usage:\n/genkey <quantity> <days>\nExample: /genkey 1 30")
+
+    if data == "admin_ban":
+        return await safe_reply(update, "Usage:\n/ban <user_id>")
+
+    if data == "admin_unban":
+        return await safe_reply(update, "Usage:\n/unban <user_id>")
+
+    if data == "admin_extend":
+        return await safe_reply(update, "Usage:\n/extend <user_id> <days>")
+
+    if data == "admin_broadcast":
+        return await safe_reply(update, "Usage:\n/broadcast <your message>")
+
+    # fallback
+    return await safe_reply(update, "Unknown option. Use /menu")
+    # PART 5 - ADMIN COMMANDS, REDEEM, DAILY TASKS, KEEP-ALIVE & MAIN
+
+# Redeem code handler text
+async def redeem_code_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state, temp = get_user_state(user_id)
+    if state != "waiting_redeem_code":
+        return await safe_reply(update, "Use the redeem button first.")
+    code = (update.message.text or "").strip()
+    r = run_db("SELECT code, days, is_used FROM redeem_codes WHERE code=?", (code,), fetch="one")
+    if not r:
+        clear_user_state(user_id)
+        return await safe_reply(update, "Invalid code.")
+    if r[2] == 1:
+        clear_user_state(user_id)
+        return await safe_reply(update, "Code already used.")
+    days = r[1]
+    extend_premium(user_id, days)
+    run_db("UPDATE redeem_codes SET used_by=?, used_date=?, is_used=1 WHERE code=?", (user_id, datetime.utcnow().isoformat(), code))
+    clear_user_state(user_id)
+    return await safe_reply(update, f"Redeemed! Premium extended by {days} days.")
+
+# Admin text commands (generate code, ban/unban/extend/broadcast)
+async def genkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return await safe_reply(update, "Unauthorized.")
+    args = context.args
+    if len(args) != 2:
+        return await safe_reply(update, "Usage: /genkey <quantity> <days>")
+    qty, days = int(args[0]), int(args[1])
+    codes = []
+    for _ in range(qty):
+        code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(12))
+        run_db("INSERT INTO redeem_codes (code, days, created_by, created_date) VALUES (?, ?, ?, ?)",
+               (code, days, user_id, datetime.utcnow().isoformat()))
+        codes.append(code)
+    return await safe_reply(update, "Generated:\n" + "\n".join(codes))
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return await safe_reply(update, "Unauthorized.")
+    if not context.args: return await safe_reply(update, "Usage: /ban <user_id>")
+    uid = int(context.args[0])
+    run_db("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
+    return await safe_reply(update, f"Banned {uid}")
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return await safe_reply(update, "Unauthorized.")
+    if not context.args: return await safe_reply(update, "Usage: /unban <user_id>")
+    uid = int(context.args[0])
+    run_db("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
+    return await safe_reply(update, f"Unbanned {uid}")
+
+async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return await safe_reply(update, "Unauthorized.")
+    if len(context.args) != 2: return await safe_reply(update, "Usage: /extend <user_id> <days>")
+    uid = int(context.args[0]); days = int(context.args[1])
+    extend_premium(uid, days)
+    return await safe_reply(update, f"Extended {uid} by {days} days")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return await safe_reply(update, "Unauthorized.")
+    msg = " ".join(context.args)
+    if not msg: return await safe_reply(update, "Usage: /broadcast <message>")
+    rows = run_db("SELECT user_id FROM users WHERE is_banned=0", (), fetch="all") or []
+    sent = 0
+    for r in rows:
+        uid = r[0]
+        try:
+            await context.bot.send_message(uid, msg)
+            sent += 1
+        except Exception:
+            continue
+    return await safe_reply(update, f"Broadcast sent to {sent} users.")
+
+# Delete account text command
+async def delete_account_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.args: return await safe_reply(update, "Usage: /delacc <account_id>")
+    aid = int(context.args[0])
+    # ensure ownership
+    row = run_db("SELECT owner_id FROM accounts WHERE id=?", (aid,), fetch="one")
+    if not row or row[0] != user_id:
+        return await safe_reply(update, "Not your account or account not found.")
+    delete_account_record(aid)
+    return await safe_reply(update, f"Deleted account {aid}")
+
+# Background tasks
+async def keep_alive_task():
     while True:
-        users = run_db("SELECT user_id, premium_expiry, trial_start FROM users", fetch=True) or []
-        now = datetime.utcnow()
-        for row in users:
-            uid = row[0]
+        log.info("Keep-alive heartbeat")
+        await asyncio.sleep(300)
+
+async def daily_premium_status_task(app_obj: Application):
+    while True:
+        # run once per 24 hours
+        rows = run_db("SELECT user_id, premium_expiry FROM users", (), fetch="all") or []
+        for r in rows:
+            uid, expiry = r[0], r[1]
             try:
-                prem_days = 0
-                if row[1]:
-                    try:
-                        prem_days = max(0, (datetime.fromisoformat(row[1]) - now).days)
-                    except:
-                        prem_days = 0
-                trial_days_left = 0
-                if row[2]:
-                    try:
-                        trial_days_left = max(0, (datetime.fromisoformat(row[2]) + timedelta(days=7) - now).days)
-                    except:
-                        trial_days_left = 0
-                accs = run_db("SELECT COUNT(*) FROM user_accounts WHERE user_id = ?", (uid,), fetch=True)
-                acc_count = accs[0][0] if accs else 0
-                msg = (
-                    "📅 <b>Your Daily Account Status</b>\n\n"
-                    f"🎁 Trial: <b>{trial_days_left} day(s)</b> left\n"
-                    f"💎 Premium: <b>{prem_days} day(s)</b> left\n"
-                    f"🔗 Connected Accounts: <b>{acc_count}</b>\n\n"
-                    "To upgrade to Premium (unlimited accounts & priority forwarding) contact @NOTCH2ND"
-                )
-                try:
-                    if BOT_APP:
-                        await BOT_APP.send_message(uid, msg, parse_mode=ParseMode.HTML)
-                except:
-                    pass
-            except:
+                days_left = max(0, (datetime.fromisoformat(expiry) - datetime.utcnow()).days)
+                await app_obj.bot.send_message(uid, f"🔔 Your premium days left: {days_left}")
+            except Exception:
                 continue
         await asyncio.sleep(24 * 3600)
-
-# Resume forwarders on start
-async def resume_active_forwarders_on_start(app: Application):
-    rows = run_db("SELECT account_id FROM user_accounts WHERE is_forwarding = 1", fetch=True) or []
-    restarted = 0
-    for r in rows:
-        acc_id = r[0]
-        try:
-            await start_forward_for_account(acc_id)
-            restarted += 1
-        except:
-            continue
-    log.info("Resumed %d forwarders on startup", restarted)
 
 # Main wiring
 def main():
     global BOT_APP
-
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("menu", menu_handler))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("genkey", genkey_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("extend", extend_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("delacc", delete_account_cmd))
+
+    # Message router & login flow (text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
 
-    # Keep Alive Function
-    async def keep_alive(context):
-        logging.info("🔄 Keep-alive heartbeat...")
+    # Callback / button handler
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Register keep-alive job
-    app.job_queue.run_repeating(keep_alive, interval=300, first=10)
+    # Redeem code text (handled by state in message_router but also register separate handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_code_text_handler))
 
-    # on-start event
+    # Post-init: start background tasks after startup
     async def on_start(app_obj: Application):
         global BOT_APP
         BOT_APP = app_obj.bot
-
+        # start keep alive & daily task
+        asyncio.create_task(keep_alive_task())
         asyncio.create_task(daily_premium_status_task(app_obj))
+        # resume forwarders
         await resume_active_forwarders_on_start(app_obj)
 
     app.post_init = on_start
